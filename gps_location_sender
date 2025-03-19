@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+Simple GPS sender that periodically sends GPS coordinates to a specified URL.
+Use this as a lightweight alternative to running a full Flask server.
+"""
+import time
+import json
+import socket
+import subprocess
+import requests
+import logging
+import argparse
+from datetime import datetime
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Global variables
+SEND_INTERVAL = 10  # seconds
+target_url = None
+use_simulation = False
+last_known_position = {
+    "latitude": 0.0,
+    "longitude": 0.0,
+    "altitude": 0.0,
+    "timestamp": int(time.time()),
+    "valid": False
+}
+
+def get_location_from_termux():
+    """Try to get GPS coordinates using termux-location"""
+    try:
+        # Try network provider first (faster)
+        result = subprocess.run(
+            ["termux-location", "-p", "network", "-r", "once"], 
+            capture_output=True, text=True, timeout=5
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                location = json.loads(result.stdout)
+                return {
+                    "latitude": location.get('latitude', 0.0),
+                    "longitude": location.get('longitude', 0.0),
+                    "altitude": location.get('altitude', 0.0),
+                    "timestamp": int(time.time()),
+                    "valid": True
+                }
+            except json.JSONDecodeError:
+                logging.error(f"Failed to parse termux-location output")
+                return None
+        
+        # If network fails, try GPS provider
+        result = subprocess.run(
+            ["termux-location", "-p", "gps", "-r", "once"], 
+            capture_output=True, text=True, timeout=5
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                location = json.loads(result.stdout)
+                return {
+                    "latitude": location.get('latitude', 0.0),
+                    "longitude": location.get('longitude', 0.0),
+                    "altitude": location.get('altitude', 0.0),
+                    "timestamp": int(time.time()),
+                    "valid": True
+                }
+            except json.JSONDecodeError:
+                logging.error(f"Failed to parse termux-location output")
+                return None
+                
+    except Exception as e:
+        logging.error(f"Error getting location: {str(e)}")
+        return None
+    
+    return None
+
+def get_ip_address():
+    """Get IP address of the device"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 1))
+        ip_address = s.getsockname()[0]
+        s.close()
+        return ip_address
+    except:
+        return "127.0.0.1"
+
+def send_gps_data(url, gps_data):
+    """Send GPS data to specified URL"""
+    try:
+        response = requests.post(url, json=gps_data, timeout=5)
+        if response.status_code == 200:
+            logging.info(f"Sent GPS data to {url}: Lat={gps_data['latitude']}, Lon={gps_data['longitude']}")
+            return True
+        else:
+            logging.error(f"Failed to send GPS data. Status code: {response.status_code}")
+            return False
+    except Exception as e:
+        logging.error(f"Error sending GPS data: {str(e)}")
+        return False
+
+def create_local_server():
+    """Create a simple server to receive requests from Unity"""
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class GPSHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/position':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(last_known_position).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b'Not Found')
+        
+        def log_message(self, format, *args):
+            # Suppress HTTP request logs
+            pass
+    
+    server_address = ('', 8000)
+    httpd = HTTPServer(server_address, GPSHandler)
+    
+    thread = threading.Thread(target=httpd.serve_forever)
+    thread.daemon = True
+    thread.start()
+    
+    ip = get_ip_address()
+    logging.info(f"Local server started at http://{ip}:8000/position")
+    return f"http://{ip}:8000/position"
+    
+def main():
+    global target_url, last_known_position, SEND_INTERVAL, use_simulation
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='GPS location sender')
+    parser.add_argument('-u', '--url', help='URL to send GPS data to')
+    parser.add_argument('-i', '--interval', type=int, default=10, help='Send interval in seconds')
+    parser.add_argument('-s', '--simulation', action='store_true', help='Use simulated data')
+    args = parser.parse_args()
+    
+    if args.interval:
+        SEND_INTERVAL = args.interval
+    
+    if args.simulation:
+        use_simulation = True
+        logging.info("Using simulation mode")
+    
+    # Create local server to serve GPS data
+    local_url = create_local_server()
+    
+    # If external URL is provided, we'll send data there too
+    target_url = args.url
+    
+    print("\n" + "="*50)
+    print(f" GPS Sender running - sending every {SEND_INTERVAL} seconds")
+    if target_url:
+        print(f" Sending to: {target_url}")
+    print(f" Local access: {local_url}")
+    print("="*50 + "\n")
+
+    # Main loop
+    while True:
+        # Get current location
+        if not use_simulation:
+            new_location = get_location_from_termux()
+            if new_location:
+                last_known_position = new_location
+                logging.info(f"Got location: Lat={last_known_position['latitude']}, Lon={last_known_position['longitude']}")
+            else:
+                last_known_position["timestamp"] = int(time.time())
+                logging.warning("Failed to get location")
+        else:
+            # In simulation mode, just update the timestamp
+            last_known_position["timestamp"] = int(time.time())
+            
+        # Send to external URL if specified
+        if target_url:
+            send_gps_data(target_url, last_known_position)
+            
+        # Display current status
+        now = datetime.now().strftime("%H:%M:%S")
+        if last_known_position["valid"]:
+            print(f"[{now}] Position: Lat={last_known_position['latitude']}, Lon={last_known_position['longitude']}")
+        else:
+            print(f"[{now}] No valid position data")
+            
+        # Wait for next update
+        time.sleep(SEND_INTERVAL)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nExiting...")
