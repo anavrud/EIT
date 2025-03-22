@@ -1,0 +1,334 @@
+from flask import Flask, jsonify, render_template_string, request, make_response
+from threading import Thread
+import time
+import socket
+import logging
+import random
+import subprocess
+import json
+
+app = Flask(__name__)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Global variable to store the latest GPS coordinates
+gps_data = {
+    "latitude": 0.0,
+    "longitude": 0.0,
+    "altitude": 0.0,
+    "timestamp": int(time.time()),
+    "valid": False  # Add a flag to indicate if the data is valid
+}
+
+# Configuration
+use_simulation = False      # Will be set to True if real GPS fails
+location_timeout = 5        # Reduce timeout to 5 seconds (was 10)
+
+def update_gps_from_termux():
+    """Get GPS coordinates using termux-location"""
+    global gps_data, use_simulation
+    
+    try:
+        # Try network provider first as it's usually faster
+        result = subprocess.run(
+            ["termux-location", "-p", "network", "-r", "once"], 
+            capture_output=True, text=True, timeout=location_timeout
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                location = json.loads(result.stdout)
+                gps_data = {
+                    "latitude": location.get('latitude', 0.0),
+                    "longitude": location.get('longitude', 0.0),
+                    "altitude": location.get('altitude', 0.0),
+                    "timestamp": int(time.time()),
+                    "valid": True  # Real GPS data is valid
+                }
+                logging.info(f"GPS updated via termux (network): Lat={gps_data['latitude']}, Lon={gps_data['longitude']}")
+                return True
+            except json.JSONDecodeError:
+                logging.error(f"Failed to parse termux-location output: {result.stdout}")
+        else:
+            # If network fails, try GPS provider (might be slower/timeout)
+            try:
+                result = subprocess.run(
+                    ["termux-location", "-p", "gps", "-r", "once"], 
+                    capture_output=True, text=True, timeout=location_timeout
+                )
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    try:
+                        location = json.loads(result.stdout)
+                        gps_data = {
+                            "latitude": location.get('latitude', 0.0),
+                            "longitude": location.get('longitude', 0.0),
+                            "altitude": location.get('altitude', 0.0),
+                            "timestamp": int(time.time()),
+                            "valid": True  # Real GPS data is valid
+                        }
+                        logging.info(f"GPS updated via termux (gps): Lat={gps_data['latitude']}, Lon={gps_data['longitude']}")
+                        return True
+                    except json.JSONDecodeError:
+                        logging.error(f"Failed to parse termux-location output: {result.stdout}")
+                else:
+                    logging.error(f"termux-location failed with both providers. Error: {result.stderr}")
+            except subprocess.TimeoutExpired:
+                logging.warning("GPS provider timed out, sticking with network data if available")
+                if gps_data["valid"]:
+                    return True
+    except subprocess.TimeoutExpired:
+        logging.error(f"termux-location timed out after {location_timeout} seconds")
+    except Exception as e:
+        logging.error(f"Failed to get location via termux: {str(e)}")
+    
+    use_simulation = True
+    return False
+
+def simulate_gps_updates():
+    """Simulate GPS movement by making small changes to coordinates"""
+    global gps_data
+    
+    # Keep the coordinates at 0 to indicate no information
+    # Don't set default coordinates - keep indicating no valid data
+    gps_data["valid"] = False  # Indicate that we don't have real GPS data
+    
+    while True:
+        # Just update the timestamp to show the server is alive
+        gps_data["timestamp"] = int(time.time())
+        
+        logging.info("Simulated GPS update: No valid GPS information available")
+        
+        time.sleep(2)
+
+def start_gps():
+    """Initialize GPS with fallback options"""
+    global use_simulation
+    
+    # Try to get location via termux-location
+    success = update_gps_from_termux()
+    if success:
+        # Start a thread to periodically update GPS
+        gps_thread = Thread(target=termux_update_thread)
+        gps_thread.daemon = True
+        gps_thread.start()
+        return
+    
+    # If all else fails, use simulation
+    logging.warning("Real GPS not available. Using simulation mode.")
+    sim_thread = Thread(target=simulate_gps_updates)
+    sim_thread.daemon = True
+    sim_thread.start()
+
+def termux_update_thread():
+    """Thread to periodically update GPS using termux-location"""
+    while True:
+        if not update_gps_from_termux() and use_simulation:
+            # If GPS update fails and we're in simulation mode, break the loop
+            # so the simulation thread can take over
+            logging.warning("Switching permanently to simulation mode")
+            sim_thread = Thread(target=simulate_gps_updates)
+            sim_thread.daemon = True
+            sim_thread.start()
+            break
+        time.sleep(5)
+
+@app.route('/position', methods=['GET'])
+def get_position():
+    global gps_data
+    try:
+        logging.info(f"Position requested from {request.remote_addr}")
+    except:
+        logging.info("Position requested")
+    
+    # Create a proper JSON response with CORS headers
+    response = make_response(jsonify(gps_data))
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+    return response
+
+@app.route('/set_position', methods=['POST'])
+def set_position():
+    """Manual endpoint to set position for testing"""
+    global gps_data, use_simulation
+    
+    try:
+        data = request.get_json()
+        if data:
+            # Update only provided fields
+            if 'latitude' in data and 'longitude' in data:
+                gps_data['latitude'] = float(data['latitude'])
+                gps_data['longitude'] = float(data['longitude'])
+                if 'altitude' in data:
+                    gps_data['altitude'] = float(data['altitude'])
+                gps_data['valid'] = True
+                gps_data['timestamp'] = int(time.time())
+                
+                # Set to manual mode
+                use_simulation = True
+                
+                logging.info(f"Position manually set to: Lat={gps_data['latitude']}, Lon={gps_data['longitude']}")
+                return jsonify({"status": "success", "message": "Position updated"})
+    except Exception as e:
+        logging.error(f"Error setting position: {str(e)}")
+    
+    return jsonify({"status": "error", "message": "Failed to update position"}), 400
+
+@app.route('/', methods=['GET'])
+def home():
+    """Provide a human-readable web interface with auto-refresh"""
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>GPS Position Server</title>
+        <meta http-equiv="refresh" content="5">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+            .container { max-width: 600px; margin: 0 auto; }
+            .card { background: #f9f9f9; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            h1 { color: #333; }
+            .coord { font-size: 18px; margin: 10px 0; }
+            .timestamp { color: #666; font-size: 14px; }
+            .info { background: #e8f4f8; padding: 15px; border-radius: 8px; margin-top: 20px; }
+            .simulation { background: #fff3cd; color: #856404; padding: 10px; border-radius: 4px; margin-top: 10px; }
+            .no-data { background: #f8d7da; color: #721c24; padding: 10px; border-radius: 4px; margin: 10px 0; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; }
+            input[type="text"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+            button { background: #4CAF50; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; }
+            button:hover { background: #45a049; }
+            .form-card { background: #f0f0f0; padding: 15px; border-radius: 8px; margin-top: 20px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>GPS Position Server</h1>
+            <div class="card">
+                {% if gps_data.valid %}
+                <div class="coord"><strong>Latitude:</strong> {{gps_data.latitude}}</div>
+                <div class="coord"><strong>Longitude:</strong> {{gps_data.longitude}}</div>
+                <div class="coord"><strong>Altitude:</strong> {{gps_data.altitude}} m</div>
+                {% else %}
+                <div class="no-data"><strong>No GPS information available</strong></div>
+                {% endif %}
+                <div class="timestamp">Last update: {{time}}</div>
+                {% if simulation %}
+                <div class="simulation"><strong>Note:</strong> GPS service in simulation mode</div>
+                {% endif %}
+            </div>
+            
+            <div class="info">
+                <p>Server is running at: <strong>{{ip}}:{{port}}</strong></p>
+                <p>HoloLens should connect to: <strong>http://{{ip}}:{{port}}/position</strong></p>
+                <p><small>This page refreshes automatically every 5 seconds</small></p>
+            </div>
+            
+            <div class="form-card">
+                <h3>Manual Position Setting</h3>
+                <p>Use this form to manually set a position for testing:</p>
+                
+                <div class="form-group">
+                    <label for="lat">Latitude:</label>
+                    <input type="text" id="lat" placeholder="e.g. 63.4305">
+                </div>
+                
+                <div class="form-group">
+                    <label for="lon">Longitude:</label>
+                    <input type="text" id="lon" placeholder="e.g. 10.3951">
+                </div>
+                
+                <div class="form-group">
+                    <label for="alt">Altitude (optional):</label>
+                    <input type="text" id="alt" placeholder="e.g. 50.0">
+                </div>
+                
+                <button onclick="setPosition()">Set Position</button>
+            </div>
+        </div>
+        
+        <script>
+            function setPosition() {
+                const lat = document.getElementById('lat').value;
+                const lon = document.getElementById('lon').value;
+                const alt = document.getElementById('alt').value;
+                
+                if (!lat || !lon) {
+                    alert('Please provide both latitude and longitude');
+                    return;
+                }
+                
+                const data = {
+                    latitude: parseFloat(lat),
+                    longitude: parseFloat(lon)
+                };
+                
+                if (alt) {
+                    data.altitude = parseFloat(alt);
+                }
+                
+                fetch('/set_position', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(data)
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert('Position updated successfully!');
+                        location.reload();
+                    } else {
+                        alert('Error: ' + data.message);
+                    }
+                })
+                .catch(error => {
+                    alert('Error: ' + error);
+                });
+            }
+        </script>
+    </body>
+    </html>
+    '''
+    
+    # Get the current time
+    current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Get server IP address
+    ip = get_ip_address()
+    
+    return render_template_string(html, gps_data=gps_data, time=current_time, 
+                                ip=ip, port=5000, simulation=use_simulation)
+
+def get_ip_address():
+    """Get the local IP address of this machine"""
+    try:
+        # Connect to a public DNS server to determine the used interface
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        # Fallback
+        return "127.0.0.1"
+
+if __name__ == '__main__':
+    # Print server info
+    ip = get_ip_address()
+    print("\n" + "="*50)
+    print(f" GPS Server running at http://{ip}:5000/")
+    print(f" HoloLens should connect to: http://{ip}:5000/position")
+    print("="*50 + "\n")
+    
+    # Start GPS in a separate thread
+    gps_thread = Thread(target=start_gps)
+    gps_thread.daemon = True
+    gps_thread.start()
+    
+    # Run Flask app on all network interfaces so it can be accessed from other devices
+    app.run(host='0.0.0.0', port=5000, debug=True)
